@@ -1,0 +1,8 @@
+import sys
+sys.path.append(r"C:\Users\Jonathan\Desktop\P3\subgraphx\src")
+
+try:
+    from algorithm.subgraphx.subgraphx import SubgraphX
+    print("✅ SubgraphX imported successfully!")
+except ImportError as e:
+    print("❌ Import failed:", e)

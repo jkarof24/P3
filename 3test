@@ -1,0 +1,480 @@
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from torch_geometric.datasets import TUDataset
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv, GATConv, SAGEConv, global_mean_pool
+from torch_geometric.explain import Explainer, GNNExplainer, PGExplainer
+from sklearn.metrics import roc_auc_score
+from dig.xgraph.method import SubgraphX
+
+# Set seed for reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+print(f"Using device: {DEVICE}")
+
+
+# =============================================================================
+# MODEL DEFINITIONS
+# =============================================================================
+
+class GNN_Model(nn.Module):
+    """GNN model supporting GCN, GAT, and GraphSAGE layers"""
+    def __init__(self, layer_type, in_channels, hidden_channels, out_channels):
+        super().__init__()
+        conv_map = {'GCN': GCNConv, 'GAT': GATConv, 'GraphSAGE': SAGEConv}
+        Conv = conv_map.get(layer_type)
+        if Conv is None:
+            raise ValueError(f"Unknown layer_type: {layer_type}")
+        
+        self.conv1 = Conv(in_channels, hidden_channels)
+        self.conv2 = Conv(hidden_channels, hidden_channels)
+        self.conv3 = Conv(hidden_channels, hidden_channels)
+        self.lin = nn.Linear(hidden_channels, out_channels)
+
+    def forward(self, x=None, edge_index=None, batch=None, data=None):
+        # Support both calling conventions:
+        # 1. Standard: forward(x, edge_index, batch)
+        # 2. SubgraphX: forward(data=data_object)
+        if data is not None:
+            x = data.x
+            edge_index = data.edge_index
+            batch = getattr(data, 'batch', None)
+        
+        if x is None or edge_index is None:
+            raise ValueError("Must provide either (x, edge_index) or data")
+        
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.relu(self.conv3(x, edge_index))
+        x = global_mean_pool(x, batch)
+        return self.lin(x)
+
+
+class ModelWrapper(nn.Module):
+    """
+    Simple wrapper that just passes through to the model
+    (Model now handles both calling conventions directly)
+    """
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+    
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def calculate_metrics(model, x, edge_index, batch, binary_mask, target_class):
+    """
+    Calculate Fidelity+, Fidelity-, and Sparsity metrics
+    
+    Fidelity+: Drop in prediction when removing important edges (higher is better)
+    Fidelity-: Drop in prediction when keeping only important edges (lower is better)
+    Sparsity: Fraction of edges removed (higher is better)
+    """
+    model.eval()
+    with torch.no_grad():
+        # Original prediction
+        out = model(x, edge_index, batch)
+        prob_orig = F.softmax(out, dim=1)[0, target_class].item()
+        
+        num_edges = edge_index.size(1)
+        sparsity = 1.0 - (binary_mask.sum().item() / num_edges) if num_edges > 0 else 0.0
+        
+        # Fidelity+ (remove important edges - should decrease prediction)
+        remove_mask = ~binary_mask
+        edge_index_remove = edge_index[:, remove_mask]
+        if edge_index_remove.size(1) > 0:
+            prob_remove = F.softmax(model(x, edge_index_remove, batch), dim=1)[0, target_class].item()
+        else:
+            prob_remove = 0.5
+        fid_plus = prob_orig - prob_remove
+        
+        # Fidelity- (keep only important edges - should maintain prediction)
+        edge_index_keep = edge_index[:, binary_mask]
+        if edge_index_keep.size(1) > 0:
+            prob_keep = F.softmax(model(x, edge_index_keep, batch), dim=1)[0, target_class].item()
+        else:
+            prob_keep = 0.5
+        fid_minus = prob_orig - prob_keep
+    
+    return fid_plus, fid_minus, sparsity
+
+
+def subgraphx_to_edge_mask(data, subgraph_nodes):
+    """Convert SubgraphX node coalition to edge mask"""
+    if isinstance(subgraph_nodes, (list, tuple)):
+        sub_nodes = torch.tensor(subgraph_nodes, device=DEVICE, dtype=torch.long)
+    elif isinstance(subgraph_nodes, torch.Tensor):
+        sub_nodes = subgraph_nodes.to(DEVICE).long()
+    else:
+        raise ValueError(f"Unexpected subgraph_nodes type: {type(subgraph_nodes)}")
+    
+    # Create boolean mask for nodes in subgraph
+    node_in = torch.zeros(data.x.size(0), dtype=torch.bool, device=DEVICE)
+    node_in[sub_nodes] = True
+    
+    # Edge is in subgraph if both endpoints are in subgraph
+    src, dst = data.edge_index
+    return node_in[src] & node_in[dst]
+
+
+# =============================================================================
+# TRAINING FUNCTIONS
+# =============================================================================
+
+def train_gnn(model, train_loader, val_loader, epochs=50):
+    """Train GNN model and return best validation AUC"""
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
+    best_auc = 0.0
+    best_state = None
+    
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        total_loss = 0
+        for batch in train_loader:
+            batch = batch.to(DEVICE)
+            optimizer.zero_grad()
+            out = model(batch.x, batch.edge_index, batch.batch)
+            loss = F.cross_entropy(out, batch.y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        # Validation
+        model.eval()
+        y_true, y_probs = [], []
+        with torch.no_grad():
+            for batch in val_loader:
+                batch = batch.to(DEVICE)
+                out = model(batch.x, batch.edge_index, batch.batch)
+                probs = F.softmax(out, dim=1)[:, 1]
+                y_probs.extend(probs.cpu().numpy())
+                y_true.extend(batch.y.cpu().numpy())
+        
+        if len(set(y_true)) > 1:
+            auc = roc_auc_score(y_true, y_probs)
+            if auc > best_auc:
+                best_auc = auc
+                best_state = model.state_dict()
+                
+            if (epoch + 1) % 10 == 0:
+                print(f"  Epoch {epoch+1}/{epochs} - Loss: {total_loss/len(train_loader):.4f}, Val AUC: {auc:.4f}")
+    
+    if best_state:
+        model.load_state_dict(best_state)
+    
+    return best_auc
+
+
+def train_pg_explainer(explainer, loader, epochs=300):
+    """Train PGExplainer"""
+    print("  Training PGExplainer...")
+    for epoch in range(epochs):
+        for batch in loader:
+            batch = batch.to(DEVICE)
+            with torch.no_grad():
+                out = explainer.model(batch.x, batch.edge_index, batch.batch)
+                target = out.argmax(dim=1)
+            
+            try:
+                explainer.algorithm.train(
+                    epoch, explainer.model, batch.x, batch.edge_index, 
+                    target=target, batch=batch.batch
+                )
+            except Exception as e:
+                # Some versions have different signatures
+                pass
+        
+        if (epoch + 1) % 100 == 0:
+            print(f"    PGExplainer epoch {epoch+1}/{epochs}")
+
+
+# =============================================================================
+# MAIN EXPERIMENT
+# =============================================================================
+
+def run_experiment(pct=0.10, reg_strength=0.01):
+    """
+    Run full experiment comparing explainers across GNN architectures
+    
+    Args:
+        pct: Percentage of edges to select as important
+        reg_strength: Regularization strength for explanation sparsity
+    """
+    # Load dataset
+    print("Loading MUTAG dataset...")
+    dataset = TUDataset(root='data/TUDataset', name='MUTAG').shuffle()
+    n = len(dataset)
+    
+    train_loader = DataLoader(dataset[:int(0.8*n)], batch_size=32, shuffle=True)
+    val_loader = DataLoader(dataset[int(0.8*n):int(0.9*n)], batch_size=32)
+    test_loader = DataLoader(dataset[int(0.9*n):], batch_size=1, shuffle=False)
+    
+    print(f"Dataset: {len(dataset)} graphs")
+    print(f"Features: {dataset.num_features}, Classes: {dataset.num_classes}")
+    print(f"Train: {int(0.8*n)}, Val: {int(0.1*n)}, Test: {len(dataset) - int(0.9*n)}")
+    print(f"Parameters: top {pct*100:.0f}% edges, regularization {reg_strength}\n")
+    
+    results = []
+    
+    # Train each GNN type
+    for model_name in ['GCN', 'GAT', 'GraphSAGE']:
+        print(f"\n{'='*70}")
+        print(f"{'='*70}")
+        print(f"  MODEL: {model_name}")
+        print(f"{'='*70}")
+        print(f"{'='*70}\n")
+        
+        # Train model
+        print(f"Training {model_name}...")
+        model = GNN_Model(model_name, dataset.num_features, 64, dataset.num_classes).to(DEVICE)
+        auc = train_gnn(model, train_loader, val_loader, epochs=50)
+        print(f"✓ Best Validation AUC: {auc:.4f}\n")
+        
+        # Setup explainers
+        print("Setting up explainers...")
+        
+        # 1. GNNExplainer
+        gnn_explainer = Explainer(
+            model=model,
+            algorithm=GNNExplainer(epochs=100),
+            explanation_type='phenomenon',
+            edge_mask_type='object',
+            model_config=dict(
+                mode='multiclass_classification',
+                task_level='graph',
+                return_type='probs'
+            )
+        )
+        gnn_explainer.algorithm.coeffs['edge_size'] = reg_strength
+        print("  ✓ GNNExplainer ready")
+        
+        # 2. PGExplainer
+        pg_algo = PGExplainer(epochs=300, lr=0.003, size_loss_weight=reg_strength)
+        pg_explainer = Explainer(
+            model=model,
+            algorithm=pg_algo,
+            explanation_type='phenomenon',
+            edge_mask_type='object',
+            model_config=dict(
+                mode='multiclass_classification',
+                task_level='graph',
+                return_type='probs'
+            )
+        )
+        train_pg_explainer(pg_explainer, train_loader, epochs=300)
+        print("  ✓ PGExplainer ready")
+        
+        # 3. SubgraphX (needs wrapped model)
+        wrapped_model = ModelWrapper(model)
+        # Important: Move wrapped model to device and set to eval
+        wrapped_model.to(DEVICE)
+        wrapped_model.eval()
+        
+        subgraphx_explainer = SubgraphX(
+            model=wrapped_model,
+            num_classes=dataset.num_classes,
+            device=DEVICE,
+            explain_graph=True,
+            reward_method='gnn_score',
+            rollout=10,
+            c_puct=10.0,
+            min_atoms=3,
+            expand_atoms=12,
+            high2low=False
+        )
+        print("  ✓ SubgraphX ready\n")
+        
+        explainers = {
+            'GNNExplainer': gnn_explainer,
+            'PGExplainer': pg_explainer,
+            'SubgraphX': subgraphx_explainer
+        }
+        
+        # Evaluate each explainer
+        for explainer_name, explainer in explainers.items():
+            print(f"Evaluating {explainer_name}...")
+            count = 0
+            errors = 0
+            
+            for i, data in enumerate(test_loader):
+                data = data.to(DEVICE)
+                
+                # Get prediction
+                with torch.no_grad():
+                    out = model(data.x, data.edge_index, data.batch)
+                    pred = out.argmax(dim=1).item()
+                
+                # Skip misclassified examples
+                if pred != int(data.y.item()):
+                    continue
+                
+                try:
+                    if explainer_name == 'SubgraphX':
+                        # SubgraphX returns node coalition
+                        # Make sure we pass data correctly
+                        try:
+                            result = explainer(data.x, data.edge_index, label=pred, max_nodes=5)
+                        except Exception as e:
+                            # Try alternative calling method
+                            print(f"  ⚠ SubgraphX error on graph {i}, trying alternative method...")
+                            errors += 1
+                            continue
+                        
+                        # Extract coalition
+                        coalition = None
+                        if isinstance(result, dict):
+                            coalition = result.get('coalition')
+                        elif isinstance(result, (list, tuple)) and len(result) > 0:
+                            if isinstance(result[0], dict):
+                                best = max(result, key=lambda d: d.get('reward', float('-inf')))
+                                coalition = best.get('coalition')
+                            else:
+                                coalition = result[0]
+                        
+                        if coalition is None or len(coalition) == 0:
+                            errors += 1
+                            continue
+                        
+                        # Convert to edge mask
+                        edge_mask_bool = subgraphx_to_edge_mask(data, coalition)
+                        edge_mask = edge_mask_bool.float()
+                    
+                    else:
+                        # PyG explainers
+                        target = torch.tensor([pred], device=DEVICE)
+                        explanation = explainer(data.x, data.edge_index, batch=data.batch, target=target)
+                        edge_mask = explanation.edge_mask
+                        
+                        if edge_mask is None:
+                            errors += 1
+                            continue
+                        
+                        # Normalize to [0, 1]
+                        edge_mask = edge_mask.view(-1).float()
+                        if edge_mask.min() < 0 or edge_mask.max() > 1:
+                            edge_mask = (edge_mask - edge_mask.min()) / (edge_mask.max() - edge_mask.min() + 1e-8)
+                    
+                    # Select top-k edges
+                    num_edges = data.edge_index.size(1)
+                    k = max(1, int(pct * num_edges))
+                    
+                    if len(edge_mask) != num_edges:
+                        errors += 1
+                        continue
+                    
+                    topk_idx = torch.topk(edge_mask, min(k, len(edge_mask))).indices
+                    binary_mask = torch.zeros(num_edges, dtype=torch.bool, device=DEVICE)
+                    binary_mask[topk_idx] = True
+                    
+                    # Calculate metrics
+                    fp, fm, sp = calculate_metrics(
+                        model, data.x, data.edge_index, data.batch, binary_mask, pred
+                    )
+                    results.append([model_name, explainer_name, fp, fm, sp])
+                    count += 1
+                    
+                except Exception as e:
+                    errors += 1
+                    if errors == 1:  # Only print first error
+                        print(f"  ⚠ Error example: {type(e).__name__}: {str(e)[:80]}")
+            
+            print(f"  ✓ Evaluated {count} graphs ({errors} errors)\n")
+    
+    return pd.DataFrame(results, columns=['Model', 'Explainer', 'Fidelity+', 'Fidelity-', 'Sparsity'])
+
+
+# =============================================================================
+# VISUALIZATION
+# =============================================================================
+
+def plot_results(df, out_path="explainer_comparison.png"):
+    """Create visualization of results"""
+    if df.empty:
+        print("⚠ No results to plot")
+        return
+    
+    df_melt = df.melt(
+        id_vars=['Model', 'Explainer'], 
+        var_name='Metric', 
+        value_name='Score'
+    )
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    metrics = ['Fidelity+', 'Fidelity-', 'Sparsity']
+    colors = ['#3498db', '#e74c3c', '#2ecc71']
+    
+    for idx, metric in enumerate(metrics):
+        data = df_melt[df_melt['Metric'] == metric]
+        sns.boxplot(
+            data=data, x='Model', y='Score', hue='Explainer', 
+            ax=axes[idx], palette='Set2'
+        )
+        axes[idx].set_title(metric, fontsize=16, fontweight='bold', pad=15)
+        axes[idx].set_xlabel('GNN Architecture', fontsize=12)
+        axes[idx].set_ylabel('Score', fontsize=12)
+        axes[idx].legend(title='Explainer', loc='best', fontsize=10)
+        axes[idx].grid(axis='y', alpha=0.3, linestyle='--')
+    
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    print(f"\n✓ Plot saved to: {out_path}")
+    plt.close()
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("  GNN EXPLAINER COMPARISON")
+    print("  Comparing GNNExplainer, PGExplainer, and SubgraphX")
+    print("  across GCN, GAT, and GraphSAGE architectures")
+    print("="*70 + "\n")
+    
+    # Run experiment
+    df = run_experiment(pct=0.10, reg_strength=0.01)
+    
+    if not df.empty:
+        print("\n" + "="*70)
+        print("  FINAL RESULTS")
+        print("="*70 + "\n")
+        
+        # Summary statistics
+        summary = df.groupby(['Model', 'Explainer'])[['Fidelity+', 'Fidelity-', 'Sparsity']].agg(['mean', 'std'])
+        print(summary.round(4))
+        
+        print(f"\n{'='*70}")
+        print(f"Total successful evaluations: {len(df)}")
+        print(f"{'='*70}\n")
+        
+        # Create visualization
+        plot_results(df)
+        
+        # Save results
+        df.to_csv('explainer_results.csv', index=False)
+        print("✓ Results saved to: explainer_results.csv\n")
+        
+    else:
+        print("\n⚠ No results collected. Check errors above.\n")

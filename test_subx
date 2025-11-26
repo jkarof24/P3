@@ -1,0 +1,508 @@
+# run_explainers.py
+import os
+import sys
+import math
+import random
+import warnings
+from typing import Optional, List, Dict, Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+
+# PyG imports
+from torch_geometric.data import Data, DataLoader
+from torch_geometric.datasets import TUDataset
+from torch_geometric.nn import GCNConv, GATConv, SAGEConv, global_mean_pool
+
+# Try to import DIG explainers; if not available, fall back to PyG explainers
+USE_DIG = False
+try:
+    # dive-into-graphs package (best-effort import paths)
+    import dive_into_graphs as dig  # type: ignore
+    # DIG exposes various explainers under different modules; try common names
+    try:
+        from dive_into_graphs.explainers import SubgraphX as DIG_SubgraphX  # type: ignore
+    except Exception:
+        DIG_SubgraphX = None
+    try:
+        from dive_into_graphs.explainers import PGExplainer as DIG_PGExplainer  # type: ignore
+    except Exception:
+        DIG_PGExplainer = None
+    try:
+        from dive_into_graphs.explainers import GNNExplainer as DIG_GNNExplainer  # type: ignore
+    except Exception:
+        DIG_GNNExplainer = None
+
+    # Some DIG versions provide a unified Explainer wrapper similar to PyG; try to import it
+    try:
+        from dive_into_graphs.explainers import Explainer as DIG_Explainer  # type: ignore
+    except Exception:
+        DIG_Explainer = None
+
+    # If at least one DIG explainer class is present, enable DIG usage
+    if any([DIG_SubgraphX, DIG_PGExplainer, DIG_GNNExplainer, DIG_Explainer]):
+        USE_DIG = True
+except Exception:
+    USE_DIG = False
+
+# Fallback imports from PyG (torch_geometric.explain)
+if not USE_DIG:
+    try:
+        from torch_geometric.explain import Explainer as TGExplainer  # type: ignore
+        from torch_geometric.explain.algorithm import GNNExplainer as TG_GNNExplainer  # type: ignore
+        from torch_geometric.explain.algorithm import PGExplainer as TG_PGExplainer  # type: ignore
+    except Exception:
+        TGExplainer = None
+        TG_GNNExplainer = None
+        TG_PGExplainer = None
+
+# Device
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# -------------------------
+# Model (flexible forward)
+# -------------------------
+class GNN_Model(nn.Module):
+    def __init__(self, layer_type: str, in_channels: int, hidden_channels: int, out_channels: int):
+        super().__init__()
+        conv_map = {'GCN': GCNConv, 'GAT': GATConv, 'GraphSAGE': SAGEConv}
+        Conv = conv_map.get(layer_type)
+        if Conv is None:
+            raise ValueError(f"Unknown layer_type: {layer_type}")
+        self.conv1 = Conv(in_channels, hidden_channels)
+        self.conv2 = Conv(hidden_channels, hidden_channels)
+        self.conv3 = Conv(hidden_channels, hidden_channels)
+        self.lin = nn.Linear(hidden_channels, out_channels)
+
+    def forward(self, x=None, edge_index=None, batch=None, data: Optional[Data]=None, **kwargs):
+        # Accept either (x, edge_index, batch) or a single Data object
+        if data is not None:
+            x = data.x
+            edge_index = data.edge_index
+            batch = getattr(data, 'batch', None)
+        if x is None or edge_index is None:
+            raise ValueError("Model forward requires x and edge_index (or data=Data).")
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.relu(self.conv3(x, edge_index))
+        x = global_mean_pool(x, batch)
+        return self.lin(x)
+
+# -------------------------
+# Utilities and adapters
+# -------------------------
+def normalize_edge_mask(edge_mask):
+    """Return a 1D float tensor on DEVICE representing edge importance."""
+    if edge_mask is None:
+        raise ValueError("edge_mask is None")
+    if isinstance(edge_mask, torch.Tensor):
+        return edge_mask.view(-1).float().to(DEVICE)
+    # If DIG returns numpy or list
+    try:
+        return torch.tensor(edge_mask, dtype=torch.float32, device=DEVICE).view(-1)
+    except Exception:
+        raise ValueError("Unsupported edge_mask type")
+
+def make_target(pred, device):
+    return torch.tensor([int(pred)], device=device)
+
+def subgraphx_to_edge_mask(data: Data, subgraph_nodes: List[int]):
+    """Convert a list of node indices (coalition) to an edge mask (bool tensor per edge)."""
+    sub_nodes = torch.tensor(list(subgraph_nodes), device=DEVICE, dtype=torch.long)
+    node_in = torch.zeros(data.x.size(0), dtype=torch.bool, device=DEVICE)
+    node_in[sub_nodes] = True
+    src, dst = data.edge_index
+    return (node_in[src] & node_in[dst])
+
+def extract_edge_mask_from_explanation(explanation: Any, num_edges: int):
+    """
+    Try to extract an edge mask from an explanation object returned by various explainers.
+    This handles common shapes: tensor, dict with 'edge_mask', attribute 'edge_mask', or raw array.
+    """
+    if explanation is None:
+        raise RuntimeError("No explanation returned")
+    # If explanation is a dict-like
+    if isinstance(explanation, dict):
+        em = explanation.get('edge_mask') or explanation.get('edge_mask_logits') or explanation.get('mask')
+        if em is not None:
+            return normalize_edge_mask(em)
+    # If explanation has attribute edge_mask
+    em = getattr(explanation, 'edge_mask', None)
+    if em is not None:
+        return normalize_edge_mask(em)
+    # If explanation is a tensor-like
+    if isinstance(explanation, torch.Tensor):
+        return normalize_edge_mask(explanation)
+    # If explanation is a list/ndarray
+    try:
+        return normalize_edge_mask(torch.tensor(explanation, device=DEVICE))
+    except Exception:
+        raise RuntimeError("Could not extract edge mask from explanation object")
+
+# -------------------------
+# Metrics
+# -------------------------
+def calculate_metrics(model, x, edge_index, batch, binary_mask, target_class):
+    model.eval()
+    with torch.no_grad():
+        out = model(x, edge_index, batch=batch)
+        prob_orig = F.softmax(out, dim=1)[0, target_class].item()
+        num_edges = edge_index.size(1)
+        sparsity = 1.0 - (binary_mask.sum().item() / num_edges) if num_edges > 0 else 0.0
+
+        # Fidelity+
+        remove_mask = ~binary_mask
+        edge_index_remove = edge_index[:, remove_mask]
+        if edge_index_remove.size(1) > 0:
+            prob_remove = F.softmax(model(x, edge_index_remove, batch=batch), dim=1)[0, target_class].item()
+        else:
+            prob_remove = 0.5
+        fid_plus = prob_orig - prob_remove
+
+        # Fidelity-
+        edge_index_keep = edge_index[:, binary_mask]
+        if edge_index_keep.size(1) > 0:
+            prob_keep = F.softmax(model(x, edge_index_keep, batch=batch), dim=1)[0, target_class].item()
+        else:
+            prob_keep = 0.5
+        fid_minus = prob_orig - prob_keep
+
+    return fid_plus, fid_minus, sparsity
+
+# -------------------------
+# Training helpers
+# -------------------------
+def train_gnn(model, train_loader, val_loader, epochs=50, lr=0.005):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
+    best_auc = 0.0
+    best_state = None
+    for epoch in range(epochs):
+        model.train()
+        for batch in train_loader:
+            batch = batch.to(DEVICE)
+            optimizer.zero_grad()
+            out = model(batch.x, batch.edge_index, batch=batch.batch)
+            loss = F.cross_entropy(out, batch.y)
+            loss.backward()
+            optimizer.step()
+
+        # Validation
+        model.eval()
+        y_true, y_probs = [], []
+        for batch in val_loader:
+            batch = batch.to(DEVICE)
+            out = model(batch.x, batch.edge_index, batch=batch.batch)
+            if out.shape[1] > 1:
+                probs = F.softmax(out, dim=1)[:, 1]
+            else:
+                probs = torch.sigmoid(out).squeeze()
+            y_probs.extend(probs.detach().cpu().numpy())
+            y_true.extend(batch.y.detach().cpu().numpy())
+
+        if len(set(y_true)) > 1:
+            auc = roc_auc_score(y_true, y_probs)
+            if auc > best_auc:
+                best_auc = auc
+                best_state = model.state_dict()
+
+    if best_state:
+        model.load_state_dict(best_state)
+    return best_auc
+
+def train_pg_explainer_fallback(explainer, loader, epochs=500):
+    """
+    Fallback training loop for PGExplainer-like objects that expose a .train method.
+    This is used when DIG-specific training helpers are not available.
+    """
+    # This function expects explainer to have attributes: model, algorithm (optional), and a train method.
+    # If explainer.algorithm has a train signature like (epoch, model, x, edge_index, target, batch), try that.
+    for epoch in range(epochs):
+        for batch in loader:
+            batch = batch.to(DEVICE)
+            with torch.no_grad():
+                out = explainer.model(batch.x, batch.edge_index, batch=batch.batch)
+                target = out.argmax(dim=1).to(DEVICE)
+            # Try a few common train signatures
+            trained = False
+            if hasattr(explainer, 'algorithm') and hasattr(explainer.algorithm, 'train'):
+                try:
+                    explainer.algorithm.train(epoch, explainer.model, batch.x, batch.edge_index, target=target, batch=batch.batch)
+                    trained = True
+                except TypeError:
+                    try:
+                        explainer.algorithm.train(explainer.model, batch.x, batch.edge_index, target=target, batch=batch.batch)
+                        trained = True
+                    except Exception:
+                        trained = False
+            if not trained and hasattr(explainer, 'train'):
+                try:
+                    explainer.train(batch.x, batch.edge_index, target=target, batch=batch.batch)
+                except Exception:
+                    pass
+
+# -------------------------
+# Explainer factory
+# -------------------------
+def build_explainers(model, num_classes, reg_strength=0.01):
+    """
+    Return a dict of explainer objects keyed by name.
+    Tries DIG explainers first; falls back to PyG explainers if DIG not available.
+    """
+    explainers = {}
+
+    # 1) GNNExplainer
+    if USE_DIG and DIG_GNNExplainer is not None and DIG_Explainer is not None:
+        try:
+            gnn_expl = DIG_Explainer(
+                model=model,
+                algorithm=DIG_GNNExplainer(epochs=100),
+                explanation_type='phenomenon',
+                edge_mask_type='object',
+                model_config=dict(mode='multiclass_classification', task_level='graph', return_type='probs')
+            )
+            # set regularization if available
+            if hasattr(gnn_expl.algorithm, 'coeffs'):
+                try:
+                    gnn_expl.algorithm.coeffs['edge_size'] = reg_strength
+                except Exception:
+                    pass
+            explainers['GNNExplainer'] = gnn_expl
+        except Exception:
+            pass
+
+    # Fallback to PyG GNNExplainer wrapper if available
+    if 'GNNExplainer' not in explainers and TG_GNNExplainer is not None and TGExplainer is not None:
+        try:
+            gnn_expl = TGExplainer(
+                model=model,
+                algorithm=TG_GNNExplainer(model),
+                explanation_type='phenomenon',
+                edge_mask_type='object',
+                model_config=dict(mode='multiclass_classification', task_level='graph', return_type='probs')
+            )
+            explainers['GNNExplainer'] = gnn_expl
+        except Exception:
+            pass
+
+    # 2) PGExplainer
+    if USE_DIG and DIG_PGExplainer is not None and DIG_Explainer is not None:
+        try:
+            pg_algo = DIG_PGExplainer(epochs=500, lr=0.003, size_loss_weight=reg_strength)
+            pg_expl = DIG_Explainer(
+                model=model,
+                algorithm=pg_algo,
+                explanation_type='phenomenon',
+                edge_mask_type='object',
+                model_config=dict(mode='multiclass_classification', task_level='graph', return_type='probs')
+            )
+            explainers['PGExplainer'] = pg_expl
+        except Exception:
+            pass
+
+    if 'PGExplainer' not in explainers and TG_PGExplainer is not None and TGExplainer is not None:
+        try:
+            pg_algo = TG_PGExplainer(model)
+            pg_expl = TGExplainer(
+                model=model,
+                algorithm=pg_algo,
+                explanation_type='phenomenon',
+                edge_mask_type='object',
+                model_config=dict(mode='multiclass_classification', task_level='graph', return_type='probs')
+            )
+            explainers['PGExplainer'] = pg_expl
+        except Exception:
+            pass
+
+    # 3) SubgraphX (DIG only; PyG does not include SubgraphX by default)
+    if USE_DIG and DIG_SubgraphX is not None:
+        try:
+            subx = DIG_SubgraphX(
+                model=model,
+                num_classes=num_classes,
+                device=DEVICE,
+                explain_graph=True,
+                reward_method='gnn_score',
+                rollout=10,
+                c_puct=10.0,
+                min_atoms=3,
+                expand_atoms=12
+            )
+            explainers['SubgraphX'] = subx
+        except Exception:
+            pass
+
+    return explainers
+
+# -------------------------
+# Experiment runner
+# -------------------------
+def run_experiment(reg_strength=0.01, pct=0.10):
+    dataset = TUDataset(root='data/TUDataset', name='MUTAG').shuffle()
+    n = len(dataset)
+    train_loader = DataLoader(dataset[:int(0.8*n)], batch_size=32, shuffle=True)
+    val_loader = DataLoader(dataset[int(0.8*n):int(0.9*n)], batch_size=32)
+    test_loader = DataLoader(dataset[int(0.9*n):], batch_size=1, shuffle=False)
+
+    results = []
+    for model_name in ['GCN', 'GAT', 'GraphSAGE']:
+        print(f"\n=== {model_name} ===")
+        model = GNN_Model(model_name, dataset.num_features, 64, dataset.num_classes).to(DEVICE)
+        auc = train_gnn(model, train_loader, val_loader)
+        print(f"Validation AUC: {auc:.4f}")
+
+        explainers = build_explainers(model, dataset.num_classes, reg_strength=reg_strength)
+        if 'PGExplainer' in explainers:
+            # Train PGExplainer if necessary
+            pg = explainers['PGExplainer']
+            # DIG PGExplainer may require a specific training helper; try to call it, else fallback
+            try:
+                if USE_DIG and hasattr(pg, 'algorithm') and hasattr(pg.algorithm, 'train'):
+                    # Some DIG versions expect a dedicated training function; try common patterns
+                    train_pg_explainer_fallback(pg, train_loader, epochs=500)
+                else:
+                    train_pg_explainer_fallback(pg, train_loader, epochs=500)
+            except Exception as e:
+                print("PGExplainer training failed or not required:", e)
+
+        # SubgraphX may be heavy; ensure it's present before using
+        for name, explainer in explainers.items():
+            count = 0
+            for i, data in enumerate(test_loader):
+                data = data.to(DEVICE)
+                with torch.no_grad():
+                    out = model(data.x, data.edge_index, batch=data.batch)
+                    pred = out.argmax(dim=1).item()
+                if pred != int(data.y.item()):
+                    continue
+
+                try:
+                    if name == 'SubgraphX':
+                        # DIG SubgraphX returns a structure with explanation results per class.
+                        # Try common return patterns: (something, explanation_results, something)
+                        try:
+                            res = explainer(data.x, data.edge_index, max_nodes=5)
+                        except TypeError:
+                            # Some SubgraphX implementations expect Data object
+                            try:
+                                res = explainer(data)
+                            except Exception:
+                                res = None
+                        # res might be tuple or dict
+                        sub_nodes = None
+                        if isinstance(res, tuple) and len(res) >= 2:
+                            explanation_results = res[1]
+                        elif isinstance(res, dict):
+                            explanation_results = res
+                        else:
+                            explanation_results = None
+
+                        if explanation_results is None:
+                            raise RuntimeError("Unexpected SubgraphX output")
+
+                        # Try to extract coalition for predicted class
+                        sub_out = explanation_results.get(pred) if isinstance(explanation_results, dict) else None
+                        if sub_out is None and isinstance(explanation_results, list):
+                            # list of dicts
+                            best = max(explanation_results, key=lambda d: d.get('reward', 0.0))
+                            sub_nodes = best.get('coalition', [])
+                        elif isinstance(sub_out, dict):
+                            sub_nodes = sub_out.get('coalition') or sub_out.get('nodes') or sub_out.get('subgraph')
+                        elif isinstance(sub_out, list):
+                            sub_nodes = sub_out
+                        if sub_nodes is None:
+                            raise RuntimeError("No subgraph found in SubgraphX output")
+                        edge_mask_bool = subgraphx_to_edge_mask(data, sub_nodes)
+                        em = edge_mask_bool.float()
+                    else:
+                        # GNNExplainer or PGExplainer (DIG or PyG wrappers)
+                        # Many Explainer wrappers accept (x, edge_index, batch=batch, target=target)
+                        target = make_target(pred, DEVICE)
+                        # Try common call signatures
+                        explanation = None
+                        try:
+                            explanation = explainer(data.x, data.edge_index, batch=data.batch, target=target)
+                        except TypeError:
+                            try:
+                                explanation = explainer(data, target=target)
+                            except Exception:
+                                try:
+                                    explanation = explainer.explain_graph(data.x, data.edge_index, batch=data.batch, target=target)
+                                except Exception:
+                                    explanation = None
+
+                        if explanation is None:
+                            raise RuntimeError("Explainer returned no explanation")
+
+                        # Extract edge mask
+                        raw_mask = None
+                        # DIG Explainer wrappers sometimes return an object with .edge_mask or dict
+                        try:
+                            raw_mask = getattr(explanation, 'edge_mask', None) or (explanation.get('edge_mask') if isinstance(explanation, dict) else None)
+                        except Exception:
+                            raw_mask = None
+
+                        if raw_mask is None:
+                            # Maybe explanation itself is the mask
+                            raw_mask = explanation
+
+                        em = extract_edge_mask_from_explanation(raw_mask, data.edge_index.size(1))
+
+                    # Binarize top-k
+                    num_edges = data.edge_index.size(1)
+                    k = max(1, int(pct * num_edges))
+                    # em should be a float tensor of length num_edges
+                    if em.numel() != num_edges:
+                        # If em is node-level or different shape, try to reshape or skip
+                        em = em.view(-1)[:num_edges]
+                    topk_idx = torch.topk(em.detach().cpu(), k).indices.to(DEVICE)
+                    bin_mask = torch.zeros(num_edges, dtype=torch.bool, device=DEVICE)
+                    bin_mask[topk_idx] = True
+
+                    fp, fm, sp = calculate_metrics(model, data.x, data.edge_index, data.batch, bin_mask, pred)
+                    results.append([model_name, name, reg_strength, fp, fm, sp])
+                    count += 1
+                except Exception as e:
+                    print(f"Error on graph {i} with {name}: {e}")
+
+            print(f"{name}: Evaluated {count} graphs")
+
+    return pd.DataFrame(results, columns=['Model', 'Explainer', 'RegStrength', 'Fidelity+', 'Fidelity-', 'Sparsity'])
+
+# -------------------------
+# Plotting helper (simple)
+# -------------------------
+def plot_results(df: pd.DataFrame):
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        sns.set(style='whitegrid')
+        agg = df.groupby(['Model', 'Explainer'])[['Fidelity+', 'Fidelity-', 'Sparsity']].mean().reset_index()
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        sns.barplot(data=agg, x='Model', y='Fidelity+', hue='Explainer', ax=axes[0])
+        sns.barplot(data=agg, x='Model', y='Fidelity-', hue='Explainer', ax=axes[1])
+        sns.barplot(data=agg, x='Model', y='Sparsity', hue='Explainer', ax=axes[2])
+        axes[0].set_title('Fidelity+')
+        axes[1].set_title('Fidelity-')
+        axes[2].set_title('Sparsity')
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print("Plotting failed:", e)
+
+# -------------------------
+# Main
+# -------------------------
+if __name__ == "__main__":
+    print("Using DIG explainers:" if USE_DIG else "DIG not available or partially available; using fallbacks where possible.")
+    df = run_experiment()
+    if df.shape[0] == 0:
+        print("No results collected.")
+    else:
+        print("\nMean Metrics:")
+        print(df.groupby(['Model', 'Explainer'])[['Fidelity+', 'Fidelity-', 'Sparsity']].mean())
+        plot_results(df)
