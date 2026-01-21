@@ -69,9 +69,6 @@ class GNN(torch.nn.Module):
             self.conv1 = SAGEConv(in_channels, hidden_channels, aggr="mean")
             self.conv2 = SAGEConv(hidden_channels, hidden_channels, aggr="mean")
 
-        else:
-            raise ValueError(f"Unknown GNN type {name}")
-
         self.lin = torch.nn.Linear(hidden_channels, out_channels)
 
     def forward(self, x, edge_index, batch):
